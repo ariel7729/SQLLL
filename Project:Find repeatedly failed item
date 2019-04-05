@@ -1,0 +1,230 @@
+import sys
+import os
+import datetime
+import calendar
+import csv
+import time
+from pyspark import SparkContext, SparkConf
+from pyspark.sql import SQLContext, HiveContext, SparkSession
+from pyspark.sql.functions import udf, lit, col, coalesce
+import pyspark.sql.functions as F
+from pyspark.sql.types import *
+from subprocess import call
+import pandas as pd
+import getpass
+import numpy as np
+import json
+reload(sys); sys.setdefaultencoding('utf8')
+
+user = getpass.getuser()
+
+print sys.argv
+
+'''
+SETTING CONSTANTS
+'''
+# from_date = "2018-08-23"
+
+'''
+Setting SPARK CONSTANTS
+
+
+'''
+
+END_DATE = datetime.datetime.combine(datetime.datetime.now(), datetime.time(0))
+END_TIME = int(time.mktime(END_DATE.timetuple()))
+HOME_PATH = '/home/yiwei.wang/'   
+SPARK_JOB_NAME = 'get info' + ' | ' + END_DATE.strftime('%Y%m%d')
+
+
+sc = SparkContext(appName=SPARK_JOB_NAME)
+
+spark = SparkSession \
+    .builder \
+    .enableHiveSupport() \
+    .getOrCreate()
+
+spark.sql('use')
+
+
+
+def nonull(stream):
+    for line in stream:
+        yield line.replace('\x00', '')
+
+def write_csv(df, file_name):
+    local_filename = file_name
+    df.write.format('csv').mode('overwrite').options(escape='"').save(file_name)
+    merge_command = '/home/work/hadoop/bin/hadoop fs -getmerge %s %s%s' % (file_name, HOME_PATH, local_filename + "_tmp")
+    print 'Running subprocess:', merge_command
+    call(merge_command, shell=True)
+    rmr_command = '/home/work/hadoop/bin/hadoop fs -rm -r %s' % (file_name)
+    print 'Running subprocess:', rmr_command
+    call(rmr_command, shell=True)
+    test_file_name = HOME_PATH + local_filename + "_tmp"
+    if '\0' in open(test_file_name).read():
+        print 'NULL bytes in file'
+    dbinputfile = open(HOME_PATH + local_filename + "_tmp", 'rU')
+    csvreader = csv.reader(nonull(dbinputfile))
+    dboutputfile = open(HOME_PATH + local_filename, 'wb')
+    dboutputfile.write('\xef\xbb\xbf')
+    dboutputfile.write(','.join(df.columns) + '\n')
+    dboutputfile = csv.writer(dboutputfile, quoting=csv.QUOTE_MINIMAL, quotechar='"')
+    lc = 0
+    for line in csvreader:
+        #line.replace('\0', '')
+        dboutputfile.writerow(line)
+        lc += 1
+    print "TOTAL LINE COUNT", lc
+    os.remove(HOME_PATH + local_filename + "_tmp")
+    os.remove(HOME_PATH + '.' + local_filename + "_tmp.crc")
+    print(
+        '***********************************************************************************')
+    print(
+        '**********************************************************************************')
+    print(
+        '************************************************************************************')
+    print(
+        '***********************************************************************************')
+    print("Completed report for %s at %s... " %
+          (file_name, datetime.datetime.now().strftime('%H:%M:%S')))
+    print(
+        '***********************************************************************************')
+    print(
+        '***********************************************************************************')
+    print(
+        '***********************************************************************************')
+    print(
+        '***********************************************************************************')
+    return lc
+
+
+def strip_control_characters(input):
+    if input:
+        import re
+        # unicode invalid characters
+        RE_XML_ILLEGAL = u'([\u0000-\u0008\u000b-\u000c\u000e-\u001f\ufffe-\uffff])' + \
+                         u'|' + \
+                         u'([%s-%s][^%s-%s])|([^%s-%s][%s-%s])|([%s-%s]$)|(^[%s-%s])' % \
+                          (unichr(0xd800),unichr(0xdbff),unichr(0xdc00),unichr(0xdfff),
+                           unichr(0xd800),unichr(0xdbff),unichr(0xdc00),unichr(0xdfff),
+                           unichr(0xd800),unichr(0xdbff),unichr(0xdc00),unichr(0xdfff),
+                           )
+        input = re.sub(RE_XML_ILLEGAL, "", input)
+        # ascii control characters
+        input = re.sub(r"[\x01-\x1F\x7F]", "", input)
+    return input
+
+
+def get_data():
+    query = """
+    SELECT 
+        item_tab.shopid,
+        item_tab.itemid,
+        decode(unbase64(item_tab.name), 'utf-8') as item_name, 
+        from_unixtime(item_tab.mtime) as mtime, 
+        history_reason.reason_id,
+        history_reason.violation_times
+        
+
+    FROM (
+         SELECT shopid, itemid, name, mtime,status
+         FROM item_v2_db__item_v2_tab
+         WHERE grass_region = 'TW' 
+         AND status in (2,3,6,7,8)
+               
+    ) AS item_tab
+    
+#banned for the same reaon for 3 times in history
+
+    JOIN (
+         SELECT audit_reason.itemid, audit_reason.reason_id, COUNT(*) as violation_times
+        
+         FROM(
+             SELECT audit_tab.itemid, explode(split(audit_tab.REASON,',')) AS reason_id
+             FROM (
+                 SELECT itemid, concat_ws(',',get_json_object(get_json_object(decode(unbase64(data),'utf-8'), "$.Reason"),"$[0].reason_id"),
+                 get_json_object(get_json_object(decode(unbase64(data),'utf-8'), "$.Reason"),"$[1].reason_id"),
+                 get_json_object(get_json_object(decode(unbase64(data),'utf-8'), "$.Reason"),"$[2].reason_id")) AS REASON
+                 FROM item_audit_db__item_audit_tab 
+                 WHERE grass_region = 'TW'
+                 AND audit_type = 12
+                 AND get_json_object(decode(unbase64(data),'utf-8'), '$.Fields[0].Name') = 'status'
+                 AND get_json_object(decode(unbase64(data),'utf-8'), '$.Fields[0].New') = '3'
+                 AND(
+                    get_json_object(get_json_object(decode(unbase64(data),'utf-8'), "$.Reason"),"$[0].reason_id") in (215, 216, 217, 218, 219, 220, 221, 230)
+                    OR
+                    get_json_object(get_json_object(decode(unbase64(data),'utf-8'), "$.Reason"),"$[1].reason_id") in (215, 216, 217, 218, 219, 220, 221, 230)
+                    OR
+                    get_json_object(get_json_object(decode(unbase64(data),'utf-8'), "$.Reason"),"$[2].reason_id") in (215, 216, 217, 218, 219, 220, 221, 230)) 
+             )AS audit_tab 
+             WHERE audit_tab.REASON <> ''
+         )AS audit_reason
+        
+         GROUP BY audit_reason.itemid, audit_reason.reason_id
+         HAVING COUNT(*) >= 3 
+    ) AS history_reason   
+    ON item_tab.itemid = history_reason.itemid
+  
+#banned for the same reaon this week
+
+    JOIN (
+        SELECT shopid, is_official_store 
+        FROM user_profile 
+        WHERE grass_region = 'TW'
+        AND is_official_store = 1 ) as user
+    ON item_tab.shopid = user.shopid
+
+    JOIN (
+        SELECT itemid, concat_ws(',',get_json_object(get_json_object(decode(unbase64(data),'utf-8'), "$.Reason"),"$[0].reason_id"),
+        get_json_object(get_json_object(decode(unbase64(data),'utf-8'), "$.Reason"),"$[1].reason_id"),
+        get_json_object(get_json_object(decode(unbase64(data),'utf-8'), "$.Reason"),"$[2].reason_id")) AS ban_reason
+         
+        FROM item_audit_db__item_audit_tab 
+        WHERE grass_region = 'TW'
+        AND audit_type = 12
+        AND mtime >= unix_timestamp(current_date())-7*24*3600
+        AND get_json_object(decode(unbase64(data),'utf-8'), '$.Fields[0].Name') = 'status'
+        AND get_json_object(decode(unbase64(data),'utf-8'), '$.Fields[0].New') = '3'
+        AND
+         (
+        get_json_object(get_json_object(decode(unbase64(data),'utf-8'), "$.Reason"),"$[0].reason_id") in (215, 216, 217, 218, 219, 220, 221, 230)
+        OR
+        get_json_object(get_json_object(decode(unbase64(data),'utf-8'), "$.Reason"),"$[1].reason_id") in (215, 216, 217, 218, 219, 220, 221, 230)
+        OR
+        get_json_object(get_json_object(decode(unbase64(data),'utf-8'), "$.Reason"),"$[2].reason_id") in (215, 216, 217, 218, 219, 220, 221, 230)
+        )
+        ) AS item_audit_tab
+    
+        ON item_tab.itemid = item_audit_tab.itemid AND history_reason.reason_id =item_audit_tab.ban_reason
+
+
+    ORDER BY item_tab.itemid
+
+
+    """.format()
+    print query
+    return spark.sql(query)
+
+
+
+
+def main():
+
+    starting_time = datetime.datetime.now()
+
+    print "Pulling data..."
+    # shopids = pd.read_excel('temp.xlsx', encoding = 'utf-8')
+    df = get_data()
+
+    print "Data cached."
+    print "Converting to pandas..."
+    df.show()
+    write_csv(df, "TW_adhoc_2019-03-18.csv")
+
+    ending_time = datetime.datetime.now()
+    print "Process started:", starting_time
+    print "Process ended:", ending_time
+
+if __name__ == '__main__':
+    main()
